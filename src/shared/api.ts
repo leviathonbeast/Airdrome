@@ -755,7 +755,7 @@ export class API {
   private getStreamUrl(id: any) {
     const { server, urlParams } = this.auth
     let bitRate = localStorage.getItem('streamQuality') || 160
-    let audioCodec = localStorage.getItem('audioCodec') || 'aac'
+    let audioCodec = localStorage.getItem('audioCodec') || 'opus'
     if (bitRate === '1000') {
       audioCodec = 'raw'
       bitRate = 0

@@ -619,12 +619,11 @@ export async function setupAudio(
     const audio = document.createElement('audio')
 
     // Check browser format support matching your preference order
-
-    if (audio.canPlayType('audio/aac') !== '') {
-      return 'aac'
-    }
     if (audio.canPlayType('audio/ogg; codecs=opus') !== '' || audio.canPlayType('audio/webm; codecs=opus') !== '') {
       return 'opus'
+    }
+    if (audio.canPlayType('audio/aac') !== '') {
+      return 'aac'
     }
     if (audio.canPlayType('audio/ogg') !== '') {
       return 'ogg'
@@ -641,35 +640,41 @@ export async function setupAudio(
   // ---------------------------------------------------------------------------
 
   let playTime = 0
+  let pauseTime = 0
 
   playerStore.setMediaSessionState('none')
 
-  audio.onplay = () => {
+  audio.onplay = async () => {
     console.info('[audio] play')
     playerStore.isPlaying = true
     playerStore.userPaused = false
     playTime = Date.now()
-    playerStore.setMediaSessionPosition()
-    playerStore.setMediaSessionState('playing')
+    await playerStore.setMediaSessionPosition()
+    await playerStore.setMediaSessionState('playing')
   }
 
-  audio.onplaying = () => {
+  audio.onplaying = async () => {
     playerStore.isPlaying = true
     playerStore.userPaused = false
     playTime = Date.now()
-    playerStore.setMediaSessionPosition()
-    playerStore.setMediaSessionState('playing')
+    await playerStore.setMediaSessionPosition()
+    await playerStore.setMediaSessionState('playing')
   }
 
-  audio.onpause = () => {
+  audio.onpause = async () => {
+    if (Date.now() - playTime < 1000 || playerStore.inTransition) {
+      await audio.play()
+      return
+    }
     console.info('[audio] pause', {
       userPaused: playerStore.userPaused,
       inTransition: playerStore.inTransition,
       ended: audio.audioElement?.ended,
     })
     playerStore.isPlaying = false
-    playerStore.setMediaSessionPosition()
-    playerStore.setMediaSessionState('paused')
+    pauseTime = Date.now()
+    await playerStore.setMediaSessionPosition()
+    await playerStore.setMediaSessionState('paused')
   }
 
   audio.onended = async () => {
@@ -696,14 +701,15 @@ export async function setupAudio(
 
   document.addEventListener('visibilitychange', () => {
     if (playerStore.isPlaying) return
-
+    if (playerStore.userPaused) return
     switch (document.visibilityState) {
       case 'visible':
-        // Resume after an interruption (call…)
-        if (!playerStore.userPaused) {
-          console.info('[page] visible -> auto resume')
-          playerStore.play()
+        // Resume after an interruption
+        console.info('[page] visible -> auto resume')
+        if (Date.now() - pauseTime > 30000) {
+          playerStore.loadTrack()
         }
+        playerStore.play()
         break
 
       case 'hidden':
@@ -737,10 +743,10 @@ export async function setupAudio(
       const removed = [...knownOutputs].some(id => !current.has(id))
       knownOutputs = current
 
-      if (removed) {
+      if (removed && Date.now() - playTime > 1000) {
         console.info('[devices] output removed -> pause')
         await audio.pause()
-      } else if (added && !playerStore.userPaused && !playerStore.isPlaying) {
+      } else if (added && !playerStore.userPaused && Date.now() - pauseTime > 1000) {
         console.info('[devices] output added -> play')
         await playerStore.play()
       }
@@ -907,14 +913,5 @@ export async function setupAudio(
   }
 
   // Restore the track that was playing when the page was last open (paused)
-  const track = playerStore.track
-  const nextTrack = playerStore.nextTrack
-  if (track) {
-    await audio.loadTrack({
-      url: track.url,
-      replayGain: track.replayGain,
-      nextUrl: nextTrack?.url,
-      paused: true
-    })
-  }
+  await playerStore.loadQueue()
 }

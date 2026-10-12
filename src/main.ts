@@ -60,7 +60,6 @@ async function bootstrapApp() {
           await Promise.all([
             useFavouriteStore(pinia).load(),
             usePlaylistStore(pinia).load(),
-            playerStore.loadQueue(),
           ])
         } catch (err) {
           console.error('Error loading user data', err)
