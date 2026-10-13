@@ -699,7 +699,7 @@ export async function setupAudio(
     }
   }
 
-  document.addEventListener('visibilitychange', () => {
+  document.addEventListener('visibilitychange', async () => {
     if (playerStore.isPlaying) return
     if (playerStore.userPaused) return
     switch (document.visibilityState) {
@@ -707,9 +707,9 @@ export async function setupAudio(
         // Resume after an interruption
         console.info('[page] visible -> auto resume')
         if (Date.now() - pauseTime > 30000) {
-          playerStore.loadTrack()
+          await audio.loadTrack()
         }
-        playerStore.play()
+        await playerStore.play()
         break
 
       case 'hidden':
