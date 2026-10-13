@@ -721,24 +721,18 @@ export async function setupAudio(
   // ---------------------------------------------------------------------------
   // Output device hot-plug (Bluetooth headphones / speakers…)
   // ---------------------------------------------------------------------------
-  // Mic permission is required: without it Chrome may not fire `devicechange`
-  // and enumerateDevices() returns entries without usable ids/labels.
 
-  const getOutputIds = async (): Promise<Set<string>> => {
+  const getDeviceIds = async (): Promise<Set<string>> => {
     const devices = await navigator.mediaDevices.enumerateDevices()
-    return new Set(
-      devices
-        .filter(d => d.kind === 'audiooutput' && d.deviceId
-          && d.deviceId !== 'default' && d.deviceId !== 'communications')
-        .map(d => d.deviceId)
-    )
+    return new Set(devices.map(d => `${d.kind}:${d.deviceId}:${d.label}`))
   }
 
-  let knownOutputs = await getOutputIds()
+  let knownOutputs = await getDeviceIds()
 
   const onDeviceChange = throttle(async () => {
+    console.info('DeviceChange')
     if (playerStore.userPaused) return
-    const current = await getOutputIds()
+    const current = await getDeviceIds()
     const added = [...current].some(id => !knownOutputs.has(id))
     const removed = [...knownOutputs].some(id => !current.has(id))
     knownOutputs = current
@@ -761,7 +755,7 @@ export async function setupAudio(
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       stream.getTracks().forEach(t => t.stop())
       // Ids are now exposed: re-baseline so the first diff isn't bogus
-      knownOutputs = await getOutputIds()
+      knownOutputs = await getDeviceIds()
       console.info('[devices] mic permission granted')
     } catch (err) {
       console.warn('[devices] mic permission denied/unavailable:', err)
@@ -776,7 +770,7 @@ export async function setupAudio(
       // Permissions API unsupported for 'microphone' (Safari, older browsers)
     }
     if (state === 'granted') {
-      knownOutputs = await getOutputIds()
+      knownOutputs = await getDeviceIds()
       return
     }
     if (state === 'denied') return
