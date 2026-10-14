@@ -706,9 +706,6 @@ export async function setupAudio(
       case 'visible':
         // Resume after an interruption
         console.info('[page] visible -> auto resume')
-        if (Date.now() - pauseTime > 30000) {
-          await audio.loadTrack()
-        }
         await playerStore.play()
         break
 
@@ -724,7 +721,12 @@ export async function setupAudio(
 
   const getDeviceIds = async (): Promise<Set<string>> => {
     const devices = await navigator.mediaDevices.enumerateDevices()
-    return new Set(devices.map(d => `${d.kind}:${d.deviceId}:${d.label}`))
+    return new Set(
+    devices
+      .filter(d => d.kind === 'audiooutput' || d.kind === 'audioinput')
+      .map(d => `${d.kind}:${d.deviceId}:${d.label}`)
+      .filter(id => !id.includes(':default:') && !id.includes(':communications:'))
+    )
   }
 
   let knownOutputs = await getDeviceIds()
