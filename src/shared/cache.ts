@@ -4,11 +4,12 @@ import { Album } from '@/shared/api'
 import { sleep } from '@/shared/utils'
 
 const CACHE_DIR = 'audio-cache'
-const CACHE_NAME = 'audio-cache-v1'
+const CACHE_NAME = 'audio-cache-v2' // keys are now audioCacheKey(), not raw URLs
+const LEGACY_CACHES = ['audio-cache-v1', 'images-cache-v1']
 
 const META_DB = 'meta-cache-v1'
 const META_STORE = 'entries'
-const META_DB_VERSION = 4 // bumped: dropped the redundant running-total store
+const META_DB_VERSION = 5 // bumped: entries are now keyed by audioCacheKey()
 
 const MAX_CACHE_SIZE_BYTES = 3 * 1024 * 1024 * 1024 // 3 GB
 
@@ -16,7 +17,8 @@ const IMAGE_CACHE_NAME = 'images-cache-v2' // must match IMAGE_CACHE in service-
 const IMAGE_CONCURRENCY = 6
 
 type MetaEntry = {
-  url: string
+  url: string // canonical key (audioCacheKey), NOT the raw track URL
+  originalUrl?: string // last raw URL seen — what listeners of the events compare against
   filename: string
   size: number
   createdAt: number
@@ -24,15 +26,31 @@ type MetaEntry = {
 }
 
 /**
- * Canonical cache key for cover art. Must stay identical to imageCacheKey()
- * in service-worker.js — both write to / read from the same Cache API store.
- * Drops volatile auth params (u/s/t/p) and normalises `al-<id>` vs `<id>`.
+ * Canonical cache keys. Raw URLs embed auth params (u/s/t/p) that change on
+ * every fresh login, so a raw URL is not a stable identity for a file.
+ * imageCacheKey must stay identical to the one in service-worker.js (the SW
+ * reads/writes the same image cache).
  */
-function imageCacheKey(url: string): string {
+export function imageCacheKey(url: string): string {
   const u = new URL(url, location.href)
+
+  // Only cover-art API URLs are normalised; external images keep their full
+  // URL (their query string may be what distinguishes them).
+  if (!u.pathname.includes('/rest/getCoverArt')) return u.href
+
+  // `al-<id>` (album lists) and `<id>` (track.image) are the same image.
   const id = (u.searchParams.get('id') || '').replace(/^al-/, '')
   const size = u.searchParams.get('size') || ''
   return `${u.origin}${u.pathname}?id=${encodeURIComponent(id)}&size=${size}`
+}
+
+/** Identity of an audio file: id + the params that change the bytes. */
+export function audioCacheKey(url: string): string {
+  const u = new URL(url, location.href)
+  const id = u.searchParams.get('id') || ''
+  const fmt = u.searchParams.get('format') || ''
+  const br = u.searchParams.get('maxBitRate') || ''
+  return `${u.origin}${u.pathname}?id=${encodeURIComponent(id)}&format=${fmt}&maxBitRate=${br}`
 }
 
 function dispatch(name: string, detail?: any) {
@@ -71,9 +89,23 @@ function openDB(): Promise<IDBDatabase> {
       if (oldVersion < 4 && db.objectStoreNames.contains('meta')) {
         db.deleteObjectStore('meta')
       }
+
+      // v5: keys changed from raw URLs to canonical keys — old entries can
+      // never match again, drop them (their files are purged in init()).
+      if (oldVersion < 5 && oldVersion > 0) {
+        req.transaction!.objectStore(META_STORE).clear()
+      }
     }
 
-    req.onsuccess = () => resolve(req.result)
+    req.onsuccess = () => {
+      const db = req.result
+      // Let deleteDatabase()/future upgrades proceed instead of being blocked.
+      db.onversionchange = () => {
+        db.close()
+        dbPromise = null
+      }
+      resolve(db)
+    }
     req.onerror = () => reject(req.error)
   })
 
@@ -133,13 +165,14 @@ async function totalCachedBytes(): Promise<number> {
   return entries.reduce((sum, e) => sum + e.size, 0)
 }
 
-async function touch(url: string): Promise<void> {
+async function touch(key: string, originalUrl?: string): Promise<void> {
   await withStore('readwrite', (store) => {
-    const req = store.get(url)
+    const req = store.get(key)
     req.onsuccess = () => {
       const entry = req.result as MetaEntry | undefined
       if (entry) {
         entry.lastAccess = Date.now()
+        if (originalUrl) entry.originalUrl = originalUrl
         store.put(entry)
       }
     }
@@ -184,10 +217,11 @@ function blobToBase64(blob: Blob): Promise<string> {
 
 async function webWrite(url: string): Promise<number | null> {
   try {
+    const key = audioCacheKey(url)
     const cache = await caches.open(CACHE_NAME)
 
-    if (await cache.match(url)) {
-      await touch(url)
+    if (await cache.match(key)) {
+      await touch(key, url)
       return 0
     }
 
@@ -197,10 +231,11 @@ async function webWrite(url: string): Promise<number | null> {
     const clone = res.clone()
     const blob = await res.blob()
 
-    await cache.put(url, clone)
+    await cache.put(key, clone)
 
     await putEntry({
-      url,
+      url: key,
+      originalUrl: url,
       filename: '',
       size: blob.size,
       createdAt: Date.now(),
@@ -214,10 +249,11 @@ async function webWrite(url: string): Promise<number | null> {
 }
 
 async function webPlayable(url: string): Promise<string> {
+  const key = audioCacheKey(url)
   const cache = await caches.open(CACHE_NAME)
-  const hit = await cache.match(url)
+  const hit = await cache.match(key)
 
-  if (hit) await touch(url)
+  if (hit) await touch(key, url)
 
   return url
 }
@@ -231,19 +267,35 @@ async function webPlayable(url: string): Promise<string> {
 /* -------------------------------------------------------------------------- */
 
 async function hasTrack(url: string): Promise<boolean> {
-  const entry = await getEntry(url)
+  const key = audioCacheKey(url)
+  const entry = await getEntry(key)
   if (!entry) return false
 
   const cache = await caches.open(CACHE_NAME)
-  const hit = await cache.match(url)
+  const hit = await cache.match(key)
 
   if (hit) {
-    await touch(url)
+    await touch(key, url)
   } else {
-    await deleteEntry(url)
+    await deleteEntry(key)
   }
 
   return !!hit
+}
+
+/**
+ * Remove a track from BOTH stores. Previously only the IndexedDB entry was
+ * deleted, so the bytes stayed on disk: eviction never actually freed space
+ * and a "deleted" track was still sitting in the Cache API.
+ */
+async function removeTrack(key: string): Promise<void> {
+  try {
+    const cache = await caches.open(CACHE_NAME)
+    await cache.delete(key)
+  } catch {
+    // best-effort — the metadata entry is still removed below
+  }
+  await deleteEntry(key)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -260,9 +312,9 @@ async function enforceLimit() {
   for (const e of entries) {
     if (total <= MAX_CACHE_SIZE_BYTES) break
 
-    await deleteEntry(e.url)
+    await removeTrack(e.url)
     total -= e.size
-    dispatch('audioCacheDeleted', e.url)
+    dispatch('audioCacheDeleted', e.originalUrl ?? e.url)
   }
 
   dispatch('audioCacheEvicted')
@@ -288,6 +340,12 @@ export const useCacheStore = defineStore('albumCache', {
     async init() {
       if (this.initialized) return
       this.initialized = true
+
+      // Purge caches left by older key schemes (their entries can't match
+      // the new keys anymore and would only waste disk).
+      for (const name of LEGACY_CACHES) {
+        void caches.delete(name).catch(() => {})
+      }
     },
 
     async processQueue() {
@@ -298,7 +356,7 @@ export const useCacheStore = defineStore('albumCache', {
       try {
         while (this.queue.length) {
           const url = this.queue.shift()!
-          this.queued.delete(url)
+          this.queued.delete(audioCacheKey(url))
 
           if (await this.hasTrack(url)) continue
 
@@ -315,9 +373,11 @@ export const useCacheStore = defineStore('albumCache', {
     },
 
     async cacheTrack(url: string) {
-      if (!url || this.queued.has(url)) return
+      if (!url) return
+      const key = audioCacheKey(url)
+      if (this.queued.has(key)) return
       this.queue.push(url)
-      this.queued.add(url)
+      this.queued.add(key)
       // processQueue guards itself with this.processing — safe to call repeatedly
       void this.processQueue()
     },
@@ -338,11 +398,11 @@ export const useCacheStore = defineStore('albumCache', {
     },
 
     async deleteTrack(url: string) {
-      const entry = await getEntry(url)
-      if (!entry) return
+      const key = audioCacheKey(url)
+      const entry = await getEntry(key)
 
-      await deleteEntry(url)
-      dispatch('audioCacheDeleted', url)
+      await removeTrack(key)
+      if (entry) dispatch('audioCacheDeleted', url)
     },
 
     async clearAllAudioCache() {
@@ -350,10 +410,23 @@ export const useCacheStore = defineStore('albumCache', {
 
       await this.clearImageCache()
 
-      // Reset the meta DB itself rather than deleting per-entry, then force
-      // the next openDB() to reconnect.
-      indexedDB.deleteDatabase(META_DB)
+      // Reset the meta DB itself rather than deleting per-entry. The open
+      // connection must be closed first, otherwise deleteDatabase() stays
+      // blocked and the metadata is never actually cleared.
+      if (dbPromise) {
+        try {
+          ;(await dbPromise).close()
+        } catch {
+          // ignore
+        }
+      }
       dbPromise = null
+      await new Promise<void>((resolve) => {
+        const req = indexedDB.deleteDatabase(META_DB)
+        req.onsuccess = () => resolve()
+        req.onerror = () => resolve()
+        req.onblocked = () => resolve()
+      })
 
       dispatch('audioCacheClearedAll')
       return true

@@ -11,13 +11,11 @@ const RUNTIME_CACHE = 'runtime-cache-v1'
 // Bumping the name drops the old v1 entries on activate.
 const IMAGE_CACHE   = 'images-cache-v2'
 
-// Audio is deliberately NOT cached here. The app (src/shared/cache.ts) owns
+// Audio is deliberately NOT handled here. The app (src/shared/cache.ts) owns
 // audio persistence explicitly — Filesystem on native, Cache API on web —
-// with its own LRU/size accounting. If the SW also opportunistically cached
-// every /rest/stream response, both systems would write to the same bytes
-// without knowing about each other: cache.ts's size accounting would silently
-// undercount real disk usage, and tracks the user never asked to keep offline
-// would show up as "cached" in the UI. One owner for audio persistence.
+// with its own LRU/size accounting. The SW never reads or writes it; the only
+// thing it must do is NOT purge that cache on activate (see ALLOWED below).
+const APP_AUDIO_CACHE = 'audio-cache-v2' // owned by cache.ts (CACHE_NAME)
 
 // Limits
 const MAX_IMAGE_ENTRIES = 10000
@@ -77,6 +75,7 @@ self.addEventListener('activate', event => {
       SHELL_CACHE,
       RUNTIME_CACHE,
       IMAGE_CACHE,
+      APP_AUDIO_CACHE, // owned by cache.ts — must NOT be purged here
     ]
 
     await Promise.all(
@@ -153,7 +152,7 @@ self.addEventListener('fetch', event => {
   const isPlaylist = url.pathname.includes('/rest/getPlaylist')
 
   if (isGenres || isArtists || isAlbums || isPlaylist) {
-    event.respondWith(networkFirst(request, RUNTIME_CACHE))
+    event.respondWith(networkFirst(request, RUNTIME_CACHE, libraryCacheKey))
     return
   }
 
@@ -171,20 +170,35 @@ self.addEventListener('fetch', event => {
 })
 
 /* -------------------------------------------------- */
-/* IMAGE CACHE KEY                                    */
+/* CACHE KEYS                                         */
+/*                                                    */
+/* Raw request URLs are bad cache keys here: they    */
+/* embed auth params (u/s/t/p — the salt/hash change */
+/* on every fresh login). Normalise them.            */
+/* imageCacheKey must stay identical to the one in   */
+/* src/shared/cache.ts.                              */
 /* -------------------------------------------------- */
 
-// Must stay identical to imageCacheKey() in src/shared/cache.ts.
-//
-// Raw URLs are a bad cache key for cover art: they embed auth params
-// (u/s/t/p — salt/hash change on every fresh login) and the same image is
-// requested under different ids (`al-<id>` from album lists vs `<id>` from
-// track.image). Key on pathname + canonical id + size only.
 function imageCacheKey(input) {
   const u = new URL(typeof input === 'string' ? input : input.url, self.location.href)
+
+  // Only cover-art API URLs are normalised. Other (external) images keep
+  // their full URL: their query strings may be what distinguishes them.
+  if (!u.pathname.includes('/rest/getCoverArt')) return u.href
+
+  // `al-<id>` (album lists) and `<id>` (track.image) are the same image.
   const id = (u.searchParams.get('id') || '').replace(/^al-/, '')
   const size = u.searchParams.get('size') || ''
   return `${u.origin}${u.pathname}?id=${encodeURIComponent(id)}&size=${size}`
+}
+
+// Library (JSON) calls: drop the volatile salt/hash/password but KEEP the
+// username so one user's offline library is never served to another.
+function libraryCacheKey(request) {
+  const u = new URL(request.url)
+  for (const k of ['s', 't', 'p']) u.searchParams.delete(k)
+  u.searchParams.sort()
+  return u.href
 }
 
 /* -------------------------------------------------- */
@@ -244,29 +258,50 @@ async function imageStrategy(request) {
 /* NETWORK FIRST                                      */
 /* -------------------------------------------------- */
 
-async function networkFirst(request, cacheName) {
+async function networkFirst(request, cacheName, keyOf) {
 
   const cache = await caches.open(cacheName)
+  const key = keyOf ? keyOf(request) : request
 
   try {
 
     const response = await fetch(request)
 
     if (response && response.status === 200) {
-      cache.put(request, response.clone()).catch(() => {})
+      if (keyOf) {
+        storeIfSubsonicOk(cache, key, response.clone())
+      } else {
+        cache.put(key, response.clone()).catch(() => {})
+      }
     }
 
     return response
 
   } catch (err) {
 
-    const cached = await cache.match(request)
+    const cached = await cache.match(key)
 
     if (cached) return cached
 
     throw err
   }
 
+}
+
+// Subsonic answers HTTP 200 even for errors ({"status":"failed"}). With
+// normalised keys such a response would overwrite a good cached one, so only
+// store payloads the server flagged as ok.
+async function storeIfSubsonicOk(cache, key, response) {
+  try {
+    const type = response.headers.get('content-type') || ''
+    if (type.includes('json')) {
+      const body = await response.clone().json()
+      if (body?.['subsonic-response']?.status !== 'ok') return
+    }
+    await cache.put(key, response)
+  } catch {
+    // ignore — caching is best-effort
+  }
 }
 
 /* -------------------------------------------------- */
