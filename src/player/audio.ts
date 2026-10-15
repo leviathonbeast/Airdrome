@@ -102,6 +102,7 @@ export class AudioController {
   onended = () => {}
   onerror = () => {}
   onplaying = () => {}
+  oncanplay = () => {}
   onwaiting = () => {}
 
   // ── Public accessors ──────────────────────────────────────────────────────
@@ -300,6 +301,7 @@ export class AudioController {
     audio.onpause    = () => this.onpause()
     audio.onplay     = () => this.onplay()
     audio.onplaying     = () => this.onplaying()
+    audio.oncanplay     = () => this.oncanplay()
     audio.onwaiting     = () => this.onwaiting()
     audio.ontimeupdate = () => this.ontimeupdate(audio.currentTime)
 
@@ -353,6 +355,7 @@ export class AudioController {
     pipeline.audio.ontimeupdate     = null
     pipeline.audio.ondurationchange = null
     pipeline.audio.onplaying        = null
+    pipeline.audio.oncanplay        = null
     pipeline.audio.onwaiting        = null
 
     // Small delay to let the current audio frame finish before disconnecting

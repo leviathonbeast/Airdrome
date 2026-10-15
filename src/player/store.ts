@@ -514,7 +514,21 @@ export async function setupAudio(
   // ── Playback events ─────────────────────────────────────────────────────
   let playTime = 0
   let pauseTime = 0
-  let retrying = false // a post-error retry is in flight
+
+  // Error retry state
+  let retryTimer: ReturnType<typeof setTimeout> | null = null // pending retry (3 s wait)
+  let retriedTrackId: string | null = null // track for which a retry was already attempted
+
+  /** Skip a broken track: next, else previous, else reset the queue. */
+  const skipBrokenTrack = () => {
+    if (playerStore.hasNext) {
+      void playerStore.next(true)
+    } else if (playerStore.hasPrevious) {
+      void playerStore.back()
+    } else {
+      void playerStore.resetQueue()
+    }
+  }
 
   playerStore.setMediaSessionState('none')
 
@@ -527,9 +541,15 @@ export async function setupAudio(
     await playerStore.setMediaSessionState('playing')
   }
 
+  audio.oncanplay = async () => {
+    await sleep(300)
+    if (playerStore.inTransition) return
+    if (!playerStore.isPlaying && !playerStore.userPaused) await audio.play()
+  }
+
   audio.onplaying = async () => {
     console.info('[audio] playing')
-    retrying = false
+    retriedTrackId = null // playback works again: allow a future retry
     playerStore.isPlaying = true
     playerStore.userPaused = false
     playTime = Date.now()
@@ -555,32 +575,51 @@ export async function setupAudio(
     }
   }
 
-  // Retry once, then show the error and skip
-  audio.onerror = async (error: any) => {
+  // First error on a track: wait 3 s, then retry from the same position.
+  // Second error on the same track: show the error and skip it.
+  audio.onerror = (error: any) => {
     console.warn('[audio] error:', error)
-    if (!retrying) {
-      retrying = true
-      await sleep(3000)
-      const track = playerStore.track
-      if (track) {
-        await audio.loadTrack({
-          url: track.url,
-          replayGain: track.replayGain,
-          nextUrl: playerStore.nextTrack?.url,
-          fade: false
-        })
-        return
-      }
+
+    const track = playerStore.track
+    if (!track) return
+    if (retryTimer) return // a retry is already pending: ignore duplicate errors
+
+    if (retriedTrackId !== track.id) {
+      retriedTrackId = track.id
+      const position = playerStore.currentTime
+      console.info('[audio] retry in 3s')
+
+      retryTimer = setTimeout(async () => {
+        retryTimer = null
+        // The user changed track while waiting: drop this retry
+        if (playerStore.track?.id !== track.id) return
+
+        playerStore.inTransition = true
+        try {
+          await audio.loadTrack({
+            url: track.url,
+            replayGain: track.replayGain,
+            nextUrl: playerStore.nextTrack?.url,
+            fade: false,
+            paused: playerStore.userPaused
+          })
+          if (position > 0) await playerStore.seek(position)
+        } catch (err) {
+          console.warn('[audio] retry failed:', err)
+          retriedTrackId = null
+          mainStore.setError(err)
+          skipBrokenTrack()
+        } finally {
+          playerStore.inTransition = false
+        }
+      }, 3000)
+      return
     }
-    retrying = false
+
+    // Retry already attempted for this track
+    retriedTrackId = null
     mainStore.setError(error)
-    if (playerStore.hasNext) {
-      void playerStore.next(true)
-    } else if (playerStore.hasPrevious) {
-      void playerStore.back()
-    } else {
-      void playerStore.resetQueue()
-    }
+    skipBrokenTrack()
   }
 
   // Auto-resume when the page becomes visible
