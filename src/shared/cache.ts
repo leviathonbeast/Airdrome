@@ -12,7 +12,7 @@ const META_DB_VERSION = 4 // bumped: dropped the redundant running-total store
 
 const MAX_CACHE_SIZE_BYTES = 3 * 1024 * 1024 * 1024 // 3 GB
 
-const IMAGE_CACHE_NAME = 'images-cache-v1'
+const IMAGE_CACHE_NAME = 'images-cache-v2' // must match IMAGE_CACHE in service-worker.js
 const IMAGE_CONCURRENCY = 6
 
 type MetaEntry = {
@@ -21,6 +21,18 @@ type MetaEntry = {
   size: number
   createdAt: number
   lastAccess: number
+}
+
+/**
+ * Canonical cache key for cover art. Must stay identical to imageCacheKey()
+ * in service-worker.js — both write to / read from the same Cache API store.
+ * Drops volatile auth params (u/s/t/p) and normalises `al-<id>` vs `<id>`.
+ */
+function imageCacheKey(url: string): string {
+  const u = new URL(url, location.href)
+  const id = (u.searchParams.get('id') || '').replace(/^al-/, '')
+  const size = u.searchParams.get('size') || ''
+  return `${u.origin}${u.pathname}?id=${encodeURIComponent(id)}&size=${size}`
 }
 
 function dispatch(name: string, detail?: any) {
@@ -408,9 +420,10 @@ export const useCacheStore = defineStore('albumCache', {
           while (queue.length) {
             const url = queue.shift()!
             try {
-              if (!(await cache.match(url))) {
+              const key = imageCacheKey(url)
+              if (!(await cache.match(key, { ignoreVary: true }))) {
                 const res = await fetch(url)
-                if (res.ok) await cache.put(url, res)
+                if (res.ok) await cache.put(key, res)
               }
             } catch {
               // network error for this image — skip silently

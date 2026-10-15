@@ -7,7 +7,9 @@ const APP_BASE = '/'
 // replaced automatically on next SW activation.
 const SHELL_CACHE = `shell-cache-${__BUILD_VERSION__}`
 const RUNTIME_CACHE = 'runtime-cache-v1'
-const IMAGE_CACHE   = 'images-cache-v1'
+// v2: entries are now keyed by imageCacheKey() instead of the raw request URL.
+// Bumping the name drops the old v1 entries on activate.
+const IMAGE_CACHE   = 'images-cache-v2'
 
 // Audio is deliberately NOT cached here. The app (src/shared/cache.ts) owns
 // audio persistence explicitly — Filesystem on native, Cache API on web —
@@ -169,6 +171,23 @@ self.addEventListener('fetch', event => {
 })
 
 /* -------------------------------------------------- */
+/* IMAGE CACHE KEY                                    */
+/* -------------------------------------------------- */
+
+// Must stay identical to imageCacheKey() in src/shared/cache.ts.
+//
+// Raw URLs are a bad cache key for cover art: they embed auth params
+// (u/s/t/p — salt/hash change on every fresh login) and the same image is
+// requested under different ids (`al-<id>` from album lists vs `<id>` from
+// track.image). Key on pathname + canonical id + size only.
+function imageCacheKey(input) {
+  const u = new URL(typeof input === 'string' ? input : input.url, self.location.href)
+  const id = (u.searchParams.get('id') || '').replace(/^al-/, '')
+  const size = u.searchParams.get('size') || ''
+  return `${u.origin}${u.pathname}?id=${encodeURIComponent(id)}&size=${size}`
+}
+
+/* -------------------------------------------------- */
 /* IMAGE STRATEGY                                     */
 /* Cache first + background update                    */
 /* -------------------------------------------------- */
@@ -176,8 +195,9 @@ self.addEventListener('fetch', event => {
 async function imageStrategy(request) {
 
   const cache = await caches.open(IMAGE_CACHE)
+  const key = imageCacheKey(request)
 
-  const cached = await cache.match(request)
+  const cached = await cache.match(key, { ignoreVary: true })
 
   // Return cached immediately
   if (cached) {
@@ -188,7 +208,7 @@ async function imageStrategy(request) {
 
         if (response && response.ok) {
 
-          await cache.put(request, response.clone())
+          await cache.put(key, response.clone())
           maybeTrimCache(IMAGE_CACHE, MAX_IMAGE_ENTRIES)
 
         }
@@ -205,7 +225,7 @@ async function imageStrategy(request) {
 
     if (response && response.ok) {
 
-      await cache.put(request, response.clone())
+      await cache.put(key, response.clone())
       maybeTrimCache(IMAGE_CACHE, MAX_IMAGE_ENTRIES)
 
     }
